@@ -242,6 +242,11 @@ class RAGSystem:
         self.chunk_size = 200  # Reduced from 500 for more focused chunks
         self.chunk_overlap = 50
         self.use_simple_embedding = not SENTENCE_TRANSFORMERS_AVAILABLE
+        self._stopwords = {
+            "a","an","the","and","or","but","if","then","than","to","of","in","on","for","with",
+            "is","are","was","were","be","being","been","by","as","at","from","this","that","these","those",
+            "it","its","into","about","over","under","after","before","between","within","without","not","no"
+        }
 
     # Embeddings
     def load_embedding_model(self):
@@ -348,11 +353,11 @@ class RAGSystem:
 
         system = (
             "You are a strict, precise assistant that answers ONLY the specific question using the provided context. "
-            "Do NOT summarize unrelated information. "
-            "Cite sources inline using their tags like [file#chunk]. "
+            "Never include unrelated information. "
+            "Always cite sources inline using their tags like [file#chunk] immediately after the supporting sentence. "
             "If the answer is not in the context, say you don't have that information. "
-            "Prefer concise, factual responses. "
-            "If asked about certifications, only mention certifications and nothing else."
+            "Prefer concise, factual responses. Limit output to 5 bullets or 5 short sentences max. "
+            "If asked about certifications, output ONLY a bullet list of certifications; nothing else."
         )
         user = (
             f"Question: {query}\n\n"
@@ -365,6 +370,73 @@ class RAGSystem:
             "- If multiple chunks agree, you can cite multiple tags.\n"
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    # Post-process to enforce strictness
+    def enforce_strict_answer(self, query: str, answer: str, chunks: List[Dict[str, Any]]) -> str:
+        ql = query.lower()
+        # Trim overly long answers in general
+        def trim_to_5_units(text: str) -> str:
+            # Try bullets first
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            bullets = [l for l in lines if l.startswith("-") or l.startswith("*")]
+            if bullets:
+                return "\n".join(bullets[:5])
+            # Else split sentences
+            sents = re.split(r"(?<=[.!?])\s+", text)
+            sents = [s.strip() for s in sents if s.strip()]
+            return " ".join(sents[:5])
+
+        # General strict extraction: select top sentences relevant to the query
+        query_tokens = [w for w in re.sub(r"[^\w\s]", "", ql).split() if w and w not in self._stopwords]
+        query_set = set(query_tokens)
+
+        def semantic_score(q: str, s: str) -> float:
+            try:
+                if self.embedding_model is None:
+                    return 0.0
+                qv = self.embedding_model.encode([q])
+                sv = self.embedding_model.encode([s])
+                qv = qv[0] if isinstance(qv, list) else (qv[0] if hasattr(qv, "__getitem__") else qv)
+                sv = sv[0] if isinstance(sv, list) else (sv[0] if hasattr(sv, "__getitem__") else sv)
+                qv = np.array(qv)
+                sv = np.array(sv)
+                denom = (np.linalg.norm(qv) * np.linalg.norm(sv))
+                return float(np.dot(qv, sv) / denom) if denom else 0.0
+            except Exception:
+                return 0.0
+
+        candidates = []
+        for ch in chunks:
+            tag = f"[{ch['metadata']['filename']}#{ch['metadata']['chunk_index']}]"
+            for s in re.split(r"(?<=[.!?])\s+", ch.get("content", "")):
+                s_clean = s.strip()
+                if len(s_clean) < 20:
+                    continue
+                sl = re.sub(r"[^\w\s]", "", s_clean.lower())
+                stoks = set([w for w in sl.split() if w and w not in self._stopwords])
+                overlap = len(query_set.intersection(stoks))
+                if overlap == 0:
+                    continue
+                sim = semantic_score(query, s_clean)
+                score = overlap + 0.5 * sim
+                candidates.append((score, s_clean, tag))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top = candidates[:5]
+        if top:
+            # Deduplicate sentences conservatively
+            seen = set()
+            out_lines = []
+            for _, s, tag in top:
+                key = s.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out_lines.append(f"- {s} {tag}")
+            return "\n".join(out_lines)
+
+        # Fallback to trimmed LLM output
+        return trim_to_5_units(answer)
 
     # Call LLM
     @staticmethod
@@ -501,6 +573,8 @@ with left:
                         answer = "I couldn't find enough context to answer. Try rephrasing or uploading richer documents."
                     answer += "\n\n_(LLM failed; provided extractive fallback.)_"
 
+                # Enforce concise/targeted output
+                answer = st.session_state.rag.enforce_strict_answer(query, answer, chunks)
                 t1 = time.time()
                 st.session_state.history.append((query, answer))
                 st.success(f"Done in {t1 - t0:.2f}s")
